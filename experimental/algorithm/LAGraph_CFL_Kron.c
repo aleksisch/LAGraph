@@ -1,192 +1,200 @@
-#include <GraphBLAS.h>
-#include <LAGraph.h>
-#include <LAGraphX.h>
-#include <stdbool.h>
-#include <stdlib.h>
-
-#define LG_FREE_WORK                                                                     \
-    {                                                                                    \
-        GrB_free(&CombinedGraph);                                                        \
-    }
-
-GrB_Info transitive_closure_inplace(GrB_Matrix A) {
-    GrB_Index n;
-    GrB_Matrix_ncols(&n, A);
-
-    GrB_Matrix Frontier = NULL;
-    GrB_Matrix NextFrontier = NULL;
-
-    GrB_Matrix_dup(&Frontier, A);
-    GrB_Matrix_new(&NextFrontier, GrB_BOOL, n, n);
-
-    while (true) {
-        GrB_Matrix_clear(NextFrontier);
-        GrB_mxm(NextFrontier, NULL, NULL, GxB_ANY_PAIR_BOOL, Frontier, A, NULL);
-        GrB_assign(Frontier, A, NULL, NextFrontier, GrB_ALL, n, GrB_ALL, n, GrB_DESC_RC);
-        GrB_Index frontier_nvals;
-        GrB_Matrix_nvals(&frontier_nvals, Frontier);
-        if (frontier_nvals == 0)
-            break;
-        GrB_eWiseAdd(A, NULL, NULL, GrB_LOR, A, Frontier, NULL);
-    }
-
-    GrB_free(&Frontier);
-    GrB_free(&NextFrontier);
-    return GrB_SUCCESS;
+#define LG_FREE_WORK                                                         \
+{                                                                            \
+    GrB_free (&v_diag);                                                      \
+    GrB_free (&identity_matrix);                                             \
+    GrB_free (&start_matrix);                                                \
+    GrB_free (&final_column);                                                \
+    GrB_free (&Rblock);                                                      \
+    GrB_free (&delta);                                                       \
+    GrB_free (&DeltaM);                                                      \
+    GrB_free (&M_work);                                                      \
+    GrB_free (&Reach);                                                       \
+    GrB_free (&Frontier);                                                    \
+    GrB_free (&NextFrontier);                                                \
+    if (Sel != NULL)                                                         \
+    {                                                                        \
+        for (int64_t k = 0; k < nt_count; ++k)                               \
+        {                                                                    \
+            GrB_free (&Sel [k]);                                             \
+        }                                                                    \
+    }                                                                        \
+    LAGraph_Free ((void **) &Sel, NULL);                                     \
 }
 
-GrB_Info LAGraph_CFL_AllPaths_Kronecker(GrB_Matrix *M_intersect_out, GrB_Matrix *outputs,
-                                        const GrB_Matrix *adj_matrices,
-                                        int64_t terms_count, RSM *rsm, char *msg) {
+#define LG_FREE_ALL                                                          \
+{                                                                            \
+    LG_FREE_WORK;                                                            \
+    for (int64_t k = 0; outputs != NULL && k < nt_count; ++k)                \
+    {                                                                        \
+        GrB_free (&outputs [k]);                                             \
+    }                                                                        \
+    if (M_intersect_out != NULL) GrB_free (M_intersect_out);                 \
+}
+
+#include "LG_internal.h"
+#include <LAGraphX.h>
+
+GrB_Info LAGraph_CFL_AllPaths_Kronecker
+(
+    GrB_Matrix *M_intersect_out,                                        
+    GrB_Matrix *outputs,                                                                                  
+    const GrB_Matrix *adj_matrices,                                    
+    int64_t terms_count,            
+    RSM *rsm,                       
+    char *msg
+)
+{
+#if LAGRAPH_SUITESPARSE
+
+    GrB_Vector v_diag = NULL;
+    GrB_Matrix identity_matrix = NULL, start_matrix = NULL, final_column = NULL;
+    GrB_Matrix M_work = NULL, DeltaM = NULL;
+    GrB_Matrix Reach = NULL;
+    GrB_Matrix Frontier = NULL, NextFrontier = NULL;
+    GrB_Matrix Rblock = NULL, delta = NULL;
+    GrB_Matrix *Sel = NULL;
+    int64_t nt_count = 0;
+    LG_CLEAR_MSG;
+
+    LG_ASSERT_MSG (M_intersect_out != NULL, GrB_NULL_POINTER,
+        "The output matrix pointer cannot be null.");
+    *M_intersect_out = NULL;
+    LG_ASSERT_MSG (outputs != NULL, GrB_NULL_POINTER,
+        "The outputs array cannot be null.");
+    LG_ASSERT_MSG (adj_matrices != NULL, GrB_NULL_POINTER,
+        "The adjacency matrices array cannot be null.");
+    LG_ASSERT_MSG (rsm != NULL, GrB_NULL_POINTER, "The RSM cannot be null.");
+    LG_ASSERT_MSG (terms_count > 0, GrB_INVALID_VALUE,
+        "The number of terminals must be greater than zero.");
+    LG_ASSERT_MSG (rsm->nonterminal_count > 0, GrB_INVALID_VALUE,
+        "The number of non-terminals must be greater than zero.");
+    for (int64_t t = 0; t < terms_count; ++t)
+    {
+        LG_ASSERT_MSGF (adj_matrices [t] != NULL, GrB_NULL_POINTER,
+            "Adjacency matrix with index %" PRId64 " is null.", t);
+    }
+
+    nt_count = rsm->nonterminal_count;
+    for (int64_t nt = 0; nt < nt_count; ++nt)
+    {
+        outputs [nt] = NULL;
+    }
+
     GrB_Index g_dim;
-    GrB_Matrix_ncols(&g_dim, adj_matrices[0]);
+    GRB_TRY (GrB_Matrix_ncols (&g_dim, adj_matrices [0]));
     GrB_Index r_dim = rsm->state_count;
     GrB_Index kronecker_dim = r_dim * g_dim;
+    GrB_Index sources_count = nt_count * g_dim;
 
-    // Allocating memory for delta's (new paths from the previous iteration)
-    GrB_Matrix *delta_outputs =
-        (GrB_Matrix *)malloc(rsm->nonterminal_count * sizeof(GrB_Matrix));
-    GrB_Matrix temp_output;
-    GrB_Matrix_new(&temp_output, GrB_BOOL, g_dim, g_dim);
+    GRB_TRY (GrB_Vector_new (&v_diag, GrB_BOOL, g_dim));
+    GRB_TRY (GrB_Vector_assign_BOOL (v_diag, NULL, NULL, true, GrB_ALL, g_dim,
+        NULL));
+    GRB_TRY (GrB_Matrix_diag (&identity_matrix, v_diag, 0));
+    GRB_TRY (GrB_free (&v_diag));
 
-    GrB_Vector v_diag;
-    GrB_Vector_new(&v_diag, GrB_BOOL, g_dim);
-    GrB_Vector_assign_BOOL(v_diag, GrB_NULL, GrB_NULL, true, GrB_ALL, g_dim, NULL);
+    GRB_TRY (GrB_Matrix_new (&M_work, GrB_BOOL, kronecker_dim, kronecker_dim));
+    GRB_TRY (GrB_Matrix_new (&DeltaM, GrB_BOOL, kronecker_dim, kronecker_dim));
+    GRB_TRY (GrB_Matrix_new (&Frontier, GrB_BOOL, sources_count,
+        kronecker_dim));
+    GRB_TRY (GrB_Matrix_new (&NextFrontier, GrB_BOOL, sources_count,
+        kronecker_dim));
+    GRB_TRY (GrB_Matrix_new (&Rblock, GrB_BOOL, g_dim, kronecker_dim));
+    GRB_TRY (GrB_Matrix_new (&delta, GrB_BOOL, g_dim, g_dim));
+    GRB_TRY (GrB_Matrix_new (&start_matrix, GrB_BOOL, nt_count, r_dim));
+    GRB_TRY (GrB_Matrix_new (&final_column, GrB_BOOL, r_dim, 1));
+    LG_TRY (LAGraph_Calloc ((void **) &Sel, nt_count, sizeof (GrB_Matrix), msg));
 
-    for (int64_t nt = 0; nt < rsm->nonterminal_count; ++nt) {
-        GrB_Matrix_new(&outputs[nt], GrB_BOOL, g_dim, g_dim);
-        GrB_Matrix_new(&delta_outputs[nt], GrB_BOOL, g_dim, g_dim);
+    for (int64_t t = 0; t < terms_count; ++t)
+    {
+        GRB_TRY (GrB_kronecker (M_work, NULL, GxB_ANY_BOOL, GxB_PAIR_BOOL,
+            rsm->terminal_matrices [t], adj_matrices [t], NULL));
+    }
 
-        GrB_Index s = rsm->start_states[nt];
+    for (int64_t nt = 0; nt < nt_count; ++nt)
+    {
+        GrB_Index s = rsm->start_states [nt];
+        GRB_TRY (GrB_Matrix_setElement_BOOL (start_matrix, true, nt, s));
+
         bool is_final = false;
-        GrB_Vector_extractElement_BOOL(&is_final, rsm->final_states[nt], s);
+        GRB_TRY (GrB_Vector_extractElement_BOOL (&is_final,
+            rsm->final_states [nt], s));
 
-        if (is_final) {
-            GrB_Matrix_diag(&outputs[nt], v_diag, 0);
-            GrB_Matrix_diag(&delta_outputs[nt], v_diag, 0);
+        if (is_final)
+        {
+            GRB_TRY (GrB_Matrix_dup (&outputs [nt], identity_matrix));
+            GRB_TRY (GrB_kronecker (M_work, NULL, GxB_ANY_BOOL, GxB_PAIR_BOOL,
+                rsm->nonterminal_matrices [nt], identity_matrix, NULL));
         }
-    }
-    GrB_free(&v_diag);
+        else
+        {
+            GRB_TRY (GrB_Matrix_new (&outputs [nt], GrB_BOOL, g_dim, g_dim));
+        }
 
-    GrB_Matrix M_graph = NULL;
-    GrB_Matrix CombinedGraph = NULL;
-    GrB_Matrix DeltaM = NULL;
-
-    GrB_Matrix_new(&M_graph, GrB_BOOL, kronecker_dim, kronecker_dim);
-
-    for (int64_t t = 0; t < terms_count; ++t) {
-        GrB_kronecker(M_graph, NULL, GrB_LOR, GxB_PAIR_BOOL, rsm->terminal_matrices[t],
-                      adj_matrices[t], NULL);
+        GRB_TRY (GrB_Col_assign (final_column, NULL, NULL,
+            rsm->final_states [nt], GrB_ALL, r_dim, 0, NULL));
+        GRB_TRY (GrB_Matrix_new (&Sel [nt], GrB_BOOL, kronecker_dim, g_dim));
+        GRB_TRY (GrB_kronecker (Sel [nt], NULL, NULL, GxB_PAIR_BOOL,
+            final_column, identity_matrix, NULL));
     }
 
-    GrB_Matrix_new(&DeltaM, GrB_BOOL, kronecker_dim, kronecker_dim);
+    GRB_TRY (GrB_kronecker (Frontier, NULL, NULL, GxB_PAIR_BOOL, start_matrix,
+        identity_matrix, NULL));
+    GRB_TRY (GrB_Matrix_dup (&Reach, Frontier));
 
-    GrB_Index max_finals = 0;
-    for (int64_t nt = 0; nt < rsm->nonterminal_count; ++nt) {
-        GrB_Index f_nvals = 0;
-        GrB_Vector_nvals(&f_nvals, rsm->final_states[nt]);
-        if (f_nvals > max_finals)
-            max_finals = f_nvals;
-    }
 
-    GrB_Index *row_indices = (GrB_Index *)malloc(g_dim * sizeof(GrB_Index));
-    GrB_Index *col_indices = (GrB_Index *)malloc(g_dim * sizeof(GrB_Index));
-    GrB_Index *f_indices =
-        (GrB_Index *)malloc((max_finals > 0 ? max_finals : 1) * sizeof(GrB_Index));
-    bool *f_values = (bool *)malloc((max_finals > 0 ? max_finals : 1) * sizeof(bool));
+    GrB_Index frontier_nvals;
+    GRB_TRY (GrB_Matrix_nvals (&frontier_nvals, Frontier));
+    while (frontier_nvals > 0)
+    {
+        GRB_TRY (GrB_Matrix_clear (DeltaM));
+        for (int64_t nt = 0; nt < nt_count; ++nt)
+        {
+            GrB_Index rows [2] = { nt * g_dim, (nt + 1) * g_dim - 1 };
+            GRB_TRY (GrB_Matrix_extract (Rblock, NULL, NULL, Frontier, rows,
+                GxB_RANGE, GrB_ALL, kronecker_dim, NULL));
 
-    bool changed = true;
-    bool is_first_iteration = true;
+            GRB_TRY (GrB_mxm (delta, outputs [nt], NULL, GxB_ANY_PAIR_BOOL,
+                Rblock, Sel [nt], GrB_DESC_RSC));
 
-    while (changed) {
-        changed = false;
-        GrB_Matrix_clear(DeltaM);
-
-        // Incremental addition of non-terminals
-        bool has_new_edges = false;
-        for (int64_t nt = 0; nt < rsm->nonterminal_count; ++nt) {
-            GrB_Index delta_vals;
-            GrB_Matrix_nvals(&delta_vals, delta_outputs[nt]);
-            if (delta_vals > 0) {
-                has_new_edges = true;
-                GrB_kronecker(DeltaM, NULL, GrB_LOR, GxB_PAIR_BOOL,
-                              rsm->nonterminal_matrices[nt], delta_outputs[nt], NULL);
+            GrB_Index delta_nvals;
+            GRB_TRY (GrB_Matrix_nvals (&delta_nvals, delta));
+            if (delta_nvals > 0)
+            {
+                GRB_TRY (GrB_eWiseAdd (outputs [nt], NULL, NULL, GxB_ANY_BOOL,
+                    outputs [nt], delta, NULL));
+                GRB_TRY (GrB_kronecker (DeltaM, NULL, GxB_ANY_BOOL,
+                    GxB_PAIR_BOOL, rsm->nonterminal_matrices [nt], delta,
+                    NULL));
             }
         }
 
-        if (!has_new_edges && !is_first_iteration)
-            break;
+        GRB_TRY (GrB_mxm (NextFrontier, Reach, NULL, GxB_ANY_PAIR_BOOL,
+            Frontier, M_work, GrB_DESC_RSC));
 
-        if (has_new_edges) {
-            GrB_eWiseAdd(M_graph, NULL, NULL, GrB_LOR, M_graph, DeltaM, NULL);
+        GrB_Index new_edges;
+        GRB_TRY (GrB_Matrix_nvals (&new_edges, DeltaM));
+        if (new_edges > 0)
+        {
+            GRB_TRY (GrB_mxm (NextFrontier, Reach, GxB_ANY_BOOL,
+                GxB_ANY_PAIR_BOOL, Reach, DeltaM, GrB_DESC_SC));
+            GRB_TRY (GrB_eWiseAdd (M_work, NULL, NULL, GxB_ANY_BOOL, M_work,
+                DeltaM, NULL));
         }
 
-        if (CombinedGraph != NULL) {
-            GrB_free(&CombinedGraph);
-        }
+        GRB_TRY (GrB_eWiseAdd (Reach, NULL, NULL, GxB_ANY_BOOL, Reach,
+            NextFrontier, NULL));
 
-        GrB_Matrix_dup(&CombinedGraph, M_graph);
-
-        transitive_closure_inplace(CombinedGraph);
-
-        for (int64_t nt = 0; nt < rsm->nonterminal_count; ++nt) {
-            GrB_Matrix_clear(temp_output);
-            GrB_Index s = rsm->start_states[nt];
-
-            for (GrB_Index i = 0; i < g_dim; ++i) {
-                row_indices[i] = s * g_dim + i;
-            }
-
-            GrB_Index f_nvals = max_finals;
-            GrB_Vector_extractTuples_BOOL(f_indices, f_values, &f_nvals,
-                                          rsm->final_states[nt]);
-            for (GrB_Index k = 0; k < f_nvals; ++k) {
-                if (f_values[k]) {
-                    GrB_Index f = f_indices[k];
-                    for (GrB_Index j = 0; j < g_dim; ++j) {
-                        col_indices[j] = f * g_dim + j;
-                    }
-                    GrB_Matrix_extract(temp_output, NULL, GrB_LOR, CombinedGraph,
-                                       row_indices, g_dim, col_indices, g_dim, NULL);
-                }
-            }
-
-            // Calculate delta: we leave only those paths that were not already in
-            // outputs[nt]
-            GrB_Matrix_clear(delta_outputs[nt]);
-            GrB_assign(delta_outputs[nt], outputs[nt], NULL, temp_output, GrB_ALL, g_dim,
-                       GrB_ALL, g_dim, GrB_DESC_RC);
-
-            GrB_Index new_vals;
-            GrB_Matrix_nvals(&new_vals, delta_outputs[nt]);
-
-            if (new_vals > 0) {
-                changed = true;
-                // Saving the found paths to the main array
-                GrB_eWiseAdd(outputs[nt], NULL, NULL, GrB_LOR, outputs[nt],
-                             delta_outputs[nt], NULL);
-            }
-        }
-        is_first_iteration = false;
+        GrB_Matrix temp = Frontier;
+        Frontier = NextFrontier;
+        NextFrontier = temp;
+        GRB_TRY (GrB_Matrix_nvals (&frontier_nvals, Frontier));
     }
 
-    free(row_indices);
-    free(col_indices);
-    free(f_indices);
-    free(f_values);
-
-    for (int64_t nt = 0; nt < rsm->nonterminal_count; ++nt) {
-        GrB_free(&delta_outputs[nt]);
-    }
-    free(delta_outputs);
-
-    GrB_free(&temp_output);
-    if (CombinedGraph != NULL)
-        GrB_free(&CombinedGraph);
-    if (DeltaM != NULL)
-        GrB_free(&DeltaM);
-
-    *M_intersect_out = M_graph;
-
-    return GrB_SUCCESS;
+    *M_intersect_out = M_work;
+    M_work = NULL;
+    LG_FREE_WORK;
+    return (GrB_SUCCESS);
+#else
+    return (GrB_NOT_IMPLEMENTED);
+#endif
 }
