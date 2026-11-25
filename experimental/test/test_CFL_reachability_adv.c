@@ -1257,6 +1257,61 @@ void test_CFL_reachability_null_pointers(void) {
 #endif
 }
 
+// A symbol of an indexed family that a rule also uses alone breaks constraint 1 of
+// LAGraph_rule_EWCNF. OPT_BLOCK used to lose the pair (0, 2) here silently; it must be an error
+// for every mask. Without the rule X -> [_0 the grammar is valid and gives (0, 2).
+//
+// Graph: 0 -[_1-> 1 -]_1-> 2
+// Nonterms: [0 S] [1 C_0] [2 C_1] [3 D_0] [4 D_1] [5 X]; terms: [6 [_0] [7 [_1] [8 ]_0] [9 ]_1]
+// X -> [_0, S -> C_i D_i, C_i -> [_i, D_i -> ]_i (i = 0..1)
+void test_CFL_reachability_mixed_indexed_symbol(void) {
+#if LAGRAPH_SUITESPARSE
+    setup();
+
+    for (size_t with_plain = 0; with_plain < 2; with_plain++) {
+        for (size_t mask = 0; mask < 16; mask++) {
+            GrB_Info retval;
+
+            LAGraph_rule_EWCNF *rules = NULL;
+            LAGraph_Calloc((void **)&rules, 4, sizeof(LAGraph_rule_EWCNF), msg);
+            size_t r = 0;
+            if (with_plain) rules[r++] = (LAGraph_rule_EWCNF){5, 6, -1, 0, 0};
+            rules[r++] = (LAGraph_rule_EWCNF){
+                0, 1, 3, 2, LAGraph_EWNCF_INDEX_PROD_A | LAGraph_EWNCF_INDEX_PROD_B};
+            rules[r++] = (LAGraph_rule_EWCNF){
+                1, 6, -1, 2, LAGraph_EWNCF_INDEX_NONTERM | LAGraph_EWNCF_INDEX_PROD_A};
+            rules[r++] = (LAGraph_rule_EWCNF){
+                3, 8, -1, 2, LAGraph_EWNCF_INDEX_NONTERM | LAGraph_EWNCF_INDEX_PROD_A};
+            grammar = (grammar_t){
+                .nonterms_count = 6, .terms_count = 4, .rules_count = r, .rules = rules};
+
+            n_adj_matrices = 10;
+            LAGraph_Calloc((void **)&adj_matrices, n_adj_matrices, sizeof(GrB_Matrix), msg);
+            for (size_t i = 0; i < n_adj_matrices; i++) {
+                OK(GrB_Matrix_new(&adj_matrices[i], GrB_BOOL, 3, 3));
+            }
+            OK(GrB_Matrix_setElement(adj_matrices[7], true, 0, 1));
+            OK(GrB_Matrix_setElement(adj_matrices[9], true, 1, 2));
+            init_outputs();
+
+            if (with_plain) {
+                check_error(GrB_INVALID_VALUE, mask);
+                TEST_CHECK(strstr(msg, "Symbol 6 is used both in an indexed family") != NULL);
+                TEST_MSG("Mask: %zu, msg: %s", mask, msg);
+            } else {
+                OK(run_algorithm(mask));
+                TEST_MSG("Mask: %zx, error: %s", mask, msg);
+                check_result("(0, 2)");
+            }
+
+            free_workspace();
+        }
+    }
+
+    teardown();
+#endif
+}
+
 TEST_LIST = {
     {"CFG_reachability_indexed", test_CFL_indexed},
     {"CFG_reachability_indexed_2", test_CFL_indexed_2},
@@ -1273,6 +1328,7 @@ TEST_LIST = {
     {"CFL_reachability_line", test_CFL_reachability_line},
     {"CFL_reachability_two_nodes_cycle", test_CFL_reachability_two_nodes_cycle},
     {"CFG_reach_basic_invalid_rules", test_CFL_reachability_invalid_rules},
+    {"CFL_reachability_mixed_indexed_symbol", test_CFL_reachability_mixed_indexed_symbol},
     {"test_CFL_reachability_with_empty_adj_matrix",
      test_CFL_reachability_with_empty_adj_matrix},
 #if !defined(GRAPHBLAS_HAS_CUDA)

@@ -196,6 +196,32 @@ typedef struct {
     int32_t count;
 } CFL_Symbol;
 
+// Constraint 1 of LAGraph_rule_EWCNF: a symbol indexed in one rule must be indexed in every
+// rule where it appears. Finds a symbol that is a member of an indexed family
+// (base .. base+count-1) and is also used alone; *mixed = -1 if there is none.
+static GrB_Info find_mixed_symbol(const LAGraph_rule_EWCNF *rules, size_t rules_count,
+                                  size_t symbols_amount, int64_t *mixed, char *msg) {
+    const int bit[3] = {LAGraph_EWNCF_INDEX_NONTERM, LAGraph_EWNCF_INDEX_PROD_A,
+                        LAGraph_EWNCF_INDEX_PROD_B};
+    uint8_t *use = NULL; // 1: used alone, 2: in an indexed family
+    *mixed = -1;
+    GrB_Info info = LAGraph_Calloc((void **)&use, symbols_amount, sizeof(uint8_t), msg);
+    if (info != GrB_SUCCESS) return info;
+    for (size_t i = 0; i < rules_count; i++) {
+        const int32_t s[3] = {rules[i].nonterm, rules[i].prod_A, rules[i].prod_B};
+        for (int j = 0; j < 3; j++) {
+            if (s[j] < 0) continue;
+            bool fam = rules[i].indexed_count > 0 && (rules[i].indexed & bit[j]);
+            size_t end = (size_t)s[j] + (fam ? rules[i].indexed_count : 1);
+            for (size_t k = s[j]; k < end && k < symbols_amount; k++) use[k] |= fam ? 2 : 1;
+        }
+    }
+    for (size_t k = 0; k < symbols_amount && *mixed < 0; k++) {
+        if (use[k] == 3) *mixed = (int64_t)k;
+    }
+    return LAGraph_Free((void **)&use, msg);
+}
+
 // When using the OPT_BLOCK optimization, indexed symbols must be grouped together.
 // This produces a mapping: [old_index -> (new_index, base_index, indexed_count)]
 //   - new_index:     the index of the symbol in the new numeration
@@ -760,6 +786,12 @@ GrB_Info LAGraph_CFL_reachability_adv(
             }
         }
     }
+
+    int64_t mixed;
+    TRY(find_mixed_symbol(rules, rules_count, symbols_amount, &mixed, msg));
+    LG_ASSERT_MSGF(mixed < 0, GrB_INVALID_VALUE,
+                   "Symbol %lld is used both in an indexed family and alone.",
+                   (long long)mixed);
 
     GrB_Index n;
     TRY(GrB_Matrix_ncols(&n, adj_matrices[0]));
